@@ -11,10 +11,12 @@ pub enum Msg {
     SubmitMessage,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Clone)]
 struct MessageData {
     from: String,
     message: String,
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -25,7 +27,7 @@ pub enum MsgTypes {
     Message,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct WebSocketMessage {
     message_type: MsgTypes,
@@ -33,7 +35,7 @@ struct WebSocketMessage {
     data: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct UserProfile {
     name: String,
     avatar: String,
@@ -46,6 +48,7 @@ pub struct Chat {
     wss: WebsocketService,
     messages: Vec<MessageData>,
 }
+
 impl Component for Chat {
     type Message = Msg;
     type Properties = ();
@@ -84,51 +87,76 @@ impl Component for Chat {
     fn update(&mut self, _ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::HandleMsg(s) => {
-                let msg: WebSocketMessage = serde_json::from_str(&s).unwrap();
-                match msg.message_type {
-                    MsgTypes::Users => {
-                        let users_from_message = msg.data_array.unwrap_or_default();
-                        self.users = users_from_message
-                            .iter()
-                            .map(|u| UserProfile {
-                                name: u.into(),
-                                avatar: format!(
-                                    "https://avatars.dicebear.com/api/adventurer-neutral/{}.svg",
-                                    u
-                                )
-                                .into(),
-                            })
-                            .collect();
-                        return true;
+                match serde_json::from_str::<WebSocketMessage>(&s) {
+                    Ok(msg) => {
+                        match msg.message_type {
+                            MsgTypes::Users => {
+                                let users_from_message = msg.data_array.unwrap_or_default();
+                                self.users = users_from_message
+                                    .iter()
+                                    .map(|u| UserProfile {
+                                        name: u.into(),
+                                        avatar: format!(
+                                            "https://avatars.dicebear.com/api/adventurer-neutral/{}.svg",
+                                            u
+                                        )
+                                        .into(),
+                                    })
+                                    .collect();
+                                return true;
+                            }
+                            MsgTypes::Message => {
+                                if let Some(data) = msg.data {
+                                    match serde_json::from_str::<MessageData>(&data) {
+                                        Ok(message_data) => {
+                                            log::debug!("Received message: {:?}", message_data);
+                                            self.messages.push(message_data);
+                                            return true;
+                                        }
+                                        Err(e) => {
+                                            log::error!("Error parsing message data: {:?}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
-                    MsgTypes::Message => {
-                        let message_data: MessageData =
-                            serde_json::from_str(&msg.data.unwrap()).unwrap();
-                        self.messages.push(message_data);
-                        return true;
-                    }
-                    _ => {
-                        return false;
+                    Err(e) => {
+                        log::error!("Error parsing websocket message: {:?}", e);
                     }
                 }
+                false
             }
             Msg::SubmitMessage => {
                 let input = self.chat_input.cast::<HtmlInputElement>();
                 if let Some(input) = input {
-                    let message = WebSocketMessage {
-                        message_type: MsgTypes::Message,
-                        data: Some(input.value()),
-                        data_array: None,
-                    };
-                    if let Err(e) = self
-                        .wss
-                        .tx
-                        .clone()
-                        .try_send(serde_json::to_string(&message).unwrap())
-                    {
-                        log::debug!("error sending to channel: {:?}", e);
+                    let js_time = js_sys::Date::new_0().to_locale_time_string("id-ID");
+                    let current_time = js_time.as_string().unwrap_or_default();
+                    
+                    let message_content = input.value();
+                    if !message_content.is_empty() {
+                        let message_data = serde_json::json!({
+                            "message": message_content,
+                            "timestamp": current_time
+                        });
+                        
+                        let message = WebSocketMessage {
+                            message_type: MsgTypes::Message,
+                            data: Some(serde_json::to_string(&message_data).unwrap()),
+                            data_array: None,
+                        };
+                        
+                        if let Err(e) = self
+                            .wss
+                            .tx
+                            .clone()
+                            .try_send(serde_json::to_string(&message).unwrap())
+                        {
+                            log::error!("Error sending to channel: {:?}", e);
+                        }
+                        input.set_value("");
                     }
-                    input.set_value("");
                 };
                 false
             }
@@ -167,19 +195,40 @@ impl Component for Chat {
                     <div class="w-full grow overflow-auto border-b-2 border-gray-300">
                         {
                             self.messages.iter().map(|m| {
-                                let user = self.users.iter().find(|u| u.name == m.from).unwrap();
+                                // Find user or create a default one if not found
+                                let user_opt = self.users.iter().find(|u| u.name == m.from);
+                                let user = match user_opt {
+                                    Some(u) => u.clone(),
+                                    None => UserProfile {
+                                        name: m.from.clone(),
+                                        avatar: format!(
+                                            "https://avatars.dicebear.com/api/adventurer-neutral/{}.svg",
+                                            m.from
+                                        ),
+                                    }
+                                };
+                                
                                 html!{
                                     <div class="flex items-end w-3/6 bg-gray-100 m-8 rounded-tl-lg rounded-tr-lg rounded-br-lg ">
                                         <img class="w-8 h-8 rounded-full m-3" src={user.avatar.clone()} alt="avatar"/>
                                         <div class="p-3">
-                                            <div class="text-sm">
-                                                {m.from.clone()}
+                                            <div class="flex justify-between items-center">
+                                                <div class="text-sm">
+                                                    {m.from.clone()}
+                                                </div>
+                                                <div class="text-xs text-gray-400 ml-2">
+                                                    {m.timestamp.clone().unwrap_or_default()}
+                                                </div>
                                             </div>
-                                            <div class="text-xs text-gray-500">
-                                                if m.message.ends_with(".gif") {
-                                                    <img class="mt-3" src={m.message.clone()}/>
-                                                } else {
-                                                    {m.message.clone()}
+                                            <div class="text-xs text-gray-500 mt-1">
+                                                {
+                                                    if m.message.ends_with(".gif") {
+                                                        html! {
+                                                            <img class="mt-3" src={m.message.clone()}/>
+                                                        }
+                                                    } else {
+                                                        html! { {m.message.clone()} }
+                                                    }
                                                 }
                                             </div>
                                         </div>
@@ -187,7 +236,6 @@ impl Component for Chat {
                                 }
                             }).collect::<Html>()
                         }
-
                     </div>
                     <div class="w-full h-14 flex px-3 items-center">
                         <input ref={self.chat_input.clone()} type="text" placeholder="Message" class="block w-full py-2 pl-4 mx-3 bg-gray-100 rounded-full outline-none focus:text-gray-700" name="message" required=true />
